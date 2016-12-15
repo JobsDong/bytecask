@@ -47,62 +47,25 @@ hint_size = struct.calcsize(hint_fmt)
 hint_struct = struct.Struct(hint_fmt)
 
 
-@contextlib.contextmanager
-def build_hint_file(hint_file_name):
-    hint_file = HintFile(hint_file_name)
-    hint_file.init_write_fd()
-    try:
-        yield hint_file
-    finally:
-        hint_file.close_write_fd()
-
-
-@contextlib.contextmanager
-def read_hint_file(hint_file_name):
-    hint_file = HintFile(hint_file_name)
-    hint_file.init_read_fd()
-    try:
-        yield hint_file
-    finally:
-        hint_file.close_read_fd()
-
-
 class HintFile(object):
     """用于快速启动的索引文件
     """
 
-    def __init__(self, filename):
-        self.filename = filename
+    def __init__(self, base_path, filename):
+        self.base_path = base_path
         self.file_id = get_file_id(filename)
+        self.filename = os.path.join(base_path, filename)
         self.byte_size = 0
-        if os.path.exists(filename):
+        if os.path.exists(self.filename):
             self.byte_size = os.stat(self.filename).st_size
-        self.read_fd = None
-        self.write_fd = None
+        self.fd = open(self.filename, 'rb')
 
     @property
     def size(self):
         return self.byte_size
 
-    def init_write_fd(self):
-        self.write_fd = open(self.filename, 'ab')
-
-    def write(self, key, tstamp, value_pos, value_sz):
-        self.write_fd.write(hint_struct.pack(
-            tstamp, len(key), value_sz, value_pos) + key)
-        self.byte_size += hint_size + len(key)
-
-    def close_write_fd(self):
-        self.write_fd.close()
-
-    def init_read_fd(self):
-        self.read_fd = open(self.filename, 'rb')
-
-    def close_read_fd(self):
-        self.read_fd.close()
-
     def iter_entries(self):
-        fmmap = mmap.mmap(self.read_fd.fileno(), 0, mmap.ACCESS_READ)
+        fmmap = mmap.mmap(self.fd.fileno(), 0, access=mmap.ACCESS_READ)
         with contextlib.closing(fmmap):
             pos = 0
             while True:
@@ -123,7 +86,7 @@ class HintFile(object):
             raise EOFError
         try:
             tstamp, key_sz, value_sz, value_pos = hint_struct.unpack(
-                hint_header)[0]
+                hint_header)
         except struct.error as e:
             raise BadHeaderError(e)
 
@@ -132,6 +95,8 @@ class HintFile(object):
         pos += key_sz
         return HintEntry(tstamp, key_sz, value_sz, value_pos, key), pos
 
+    def close(self):
+        self.fd.close()
 
 DataEntry = namedtuple("DataEntry", ['crc32', 'tstamp', 'key_sz', 'value_sz', 'key', 'value'])
 
@@ -145,6 +110,64 @@ header_size = struct.calcsize(header_fmt)
 header_struct = struct.Struct(header_fmt)
 
 
+class ITempFile(object):
+
+    def __init__(self, base_path, filename):
+        self.base_path = base_path
+        self.file_id = get_file_id(filename)
+        self.filename = os.path.join(base_path, filename)
+        self.key_entries = []
+        self.byte_size = 0
+        if os.path.exists(self.filename):
+            self.byte_size = os.stat(self.filename).st_size
+        self.fd = open(self.filename, 'ab')
+
+    @property
+    def size(self):
+        return self.byte_size
+
+    def delete(self):
+        os.unlink(self.filename)
+
+    def make_immutable(self):
+        immutable_filename = self.filename.replace(IMMUTABLE_TEMP, IMMUTABLE)
+        os.rename(self.filename, immutable_filename)
+        return ImmutableFile(*os.path.split(immutable_filename))
+
+    def build_hint(self):
+        t_hint_filename = os.path.join(self.base_path, "%d.%s" % (
+            self.file_id, HINT_TEMP))
+        with open(t_hint_filename, 'wb') as hint_file:
+            for key, entry in self.key_entries:
+                hint_file.write(hint_struct.pack(
+                    entry.tstamp, len(key), entry.value_sz,
+                    entry.value_pos) + key)
+        hint_filename = t_hint_filename.replace(HINT_TEMP, HINT)
+        os.rename(t_hint_filename, hint_filename)
+
+    def update_keydir(self, keydir):
+        for key, entry in self.key_entries:
+            if key in keydir and keydir[key].tstamp <= entry.tstamp:
+                keydir[key] = entry
+
+    def write(self, key, value):
+        tstamp = time.time()
+        key_sz = len(key)
+        value_sz = len(value)
+        header_bytes = header_struct.pack(tstamp, key_sz, value_sz)
+        crc32 = zlib.crc32(header_bytes + key + value) & 0xffffffff
+        value_pos = self.byte_size + crc32_size + header_size + key_sz
+        self.fd.write(crc32_struct.pack(crc32) + header_bytes + key + value)
+        self.byte_size = value_pos + value_sz
+        self.key_entries.append((key, KeydirEntry(
+            self.file_id, tstamp, value_sz, value_pos)))
+
+    def close(self):
+        self.fd.flush()
+        os.fsync(self.fd.fileno())
+        self.fd.close()
+
+
 class DataFile(object):
 
     def __init__(self, base_path, filename):
@@ -156,28 +179,11 @@ class DataFile(object):
         self.byte_size = 0
         if os.path.exists(self.filename):
             self.byte_size = os.stat(self.filename).st_size
-        self.read_fd = None
-        self.write_fd = None
+        self.fd = None
 
     @property
     def size(self):
         return self.byte_size
-
-    def init_read_fd(self):
-        self.read_fd = open(self.filename, "rb")
-
-    def close_read_fd(self):
-        if self.read_fd:
-            self.read_fd.close()
-
-    def init_write_fd(self):
-        self.write_fd = open(self.filename, 'ab')
-
-    def close_write_fd(self):
-        if self.write_fd:
-            self.write_fd.flush()
-            os.fsync(self.write_fd.fileno())
-            self.write_fd.close()
 
     def exists(self):
         return os.path.exists(self.filename)
@@ -195,7 +201,7 @@ class DataFile(object):
     def iter_entries(self):
         """use mmap to disable cache, and large file read
         """
-        fmmap = mmap.mmap(self.read_fd.fileno(), 0, access=mmap.ACCESS_READ)
+        fmmap = mmap.mmap(self.fd.fileno(), 0, access=mmap.ACCESS_READ)
         with contextlib.closing(fmmap):
             pos = 0
             while True:
@@ -236,16 +242,38 @@ class DataFile(object):
         # verify crc
         crc32_new = zlib.crc32(header + key + value) & 0xFFFFFFFF
         if crc32_new == crc32:
-            return DataEntry(key, value, tstamp, crc32), pos
+            return DataEntry(crc32, tstamp, key_sz, value_sz, key, value), pos
         else:
             raise BadCrcError(crc32, crc32_new)
 
     def get_value(self, value_pos, value_sz):
-        self.read_fd.seek(value_pos)
-        return self.read_fd.read(value_sz)
+        self.fd.seek(value_pos)
+        return self.fd.read(value_sz)
+
+
+class ImmutableFile(DataFile):
+
+    def __init__(self, base_path, filename):
+        super(ImmutableFile, self).__init__(base_path, filename)
+        self.fd = open(self.filename, 'rb')
 
     def should_optimize(self):
         return True
+
+    def delete(self):
+        self.close()
+        os.unlink(self.filename)
+        os.unlink(self.hint_filename)
+
+    def close(self):
+        self.fd.close()
+
+
+class ActiveFile(DataFile):
+
+    def __init__(self, base_path, filename):
+        super(ActiveFile, self).__init__(base_path, filename)
+        self.fd = open(self.filename, 'ab+')
 
     def write(self, key, value):
         tstamp = time.time()
@@ -254,10 +282,22 @@ class DataFile(object):
         header_bytes = header_struct.pack(tstamp, key_sz, value_sz)
         crc32 = zlib.crc32(header_bytes + key + value) & 0xffffffff
         value_pos = self.byte_size + crc32_size + header_size + key_sz
-        self.write_fd.write(crc32_struct.pack(crc32) +
-                            header_bytes + key + value)
+        self.fd.write(crc32_struct.pack(crc32) + header_bytes + key + value)
         self.byte_size = value_pos + value_sz
         return tstamp, value_pos, value_sz
+
+    def make_immutable(self):
+        """close file and replace name
+        """
+        self.close()
+        new_immutable_filename = self.filename.replace(ACTIVE, IMMUTABLE)
+        os.rename(self.filename, new_immutable_filename)
+        return ImmutableFile(*os.path.split(new_immutable_filename))
+
+    def close(self):
+        self.fd.flush()
+        os.fsync(self.fd.fileno())
+        self.fd.close()
 
 
 KeydirEntry = namedtuple("KeydirEntry", ['file_id', 'tstamp',
@@ -293,23 +333,21 @@ class BitCask(object):
         active_file = None
         for filename in os.listdir(self.base_path):
             if IMMUTABLE in filename:
-                immutable_file = DataFile(self.base_path, filename)
-                immutable_file.init_read_fd()
+                immutable_file = ImmutableFile(self.base_path, filename)
                 self._immutables[immutable_file.file_id] = immutable_file
             elif ACTIVE in filename:
-                active_file = DataFile(self.base_path, filename)
+                active_file = ActiveFile(self.base_path, filename)
 
         if not active_file:
-            active_file = DataFile(self.base_path, "%d.%s" % (
+            active_file = ActiveFile(self.base_path, "%d.%s" % (
                 self.get_next_file_id(), ACTIVE))
 
-        active_file.init_write_fd()
-        active_file.init_read_fd()
         self._active_file = active_file
 
     def get_next_file_id(self):
         file_id = int(time.time())
-        max_immutable_file_id = max(self._immutables.keys())
+        max_immutable_file_id = max(self._immutables.keys()) \
+            if self._immutables else None
         if max_immutable_file_id and max_immutable_file_id >= file_id:
             file_id = max_immutable_file_id + 1
         if self._active_file and self._active_file.file_id >= file_id:
@@ -335,7 +373,8 @@ class BitCask(object):
         logger.info("keydir ready! keys:%d", len(self._keydir))
 
     def _load_from_hint(self, data_file):
-        with read_hint_file(data_file.hint_filename) as hint_file:
+        with contextlib.closing(
+                HintFile(*os.path.split(data_file.hint_filename))) as hint_file:
             for entry in hint_file.iter_entries():
                 if entry.value_pos == TOMBSTONE_POS:
                     self._keydir.pop(entry.key, None)
@@ -373,82 +412,53 @@ class BitCask(object):
 
         if self._active_file.size + \
                 (len(key)+len(value)+header_size+crc32_size) > self.max_file_size:
-            self._active_file.close_read_fd()
-            self._active_file.close_write_fd()
-            new_immutable_name = self._active_file.filename.replace(ACTIVE, IMMUTABLE)
-            os.rename(self._active_file.filename, new_immutable_name)
-            immutable_file = DataFile(*os.path.split(new_immutable_name))
-            immutable_file.init_read_fd()
+            logger.info("%s file is beyond max file size" % self._active_file.filename)
+            # make immutable and build new active file
+            immutable_file = self._active_file.make_immutable()
             self._immutables[immutable_file.file_id] = immutable_file
-            self._active_file = DataFile(self.base_path, "%d.%s" % (
+            self._active_file = ActiveFile(self.base_path, "%d.%s" % (
                 self.get_next_file_id(), ACTIVE))
-            self._active_file.init_read_fd()
-            self._active_file.init_write_fd()
 
         tstamp, value_pos, value_sz = self._active_file.write(key, value)
         if value != TOMBSTONE:
             self._keydir[key] = KeydirEntry(self._active_file.file_id,
                                             tstamp, value_pos, value_sz)
 
+    def optimize(self):
+        logger.info("optimizing...")
+        for data_file in self._immutables.values():
+            if not data_file.should_optimize():
+                continue
+
+            t_file_name = "%d.%s" % (self.get_next_file_id(), IMMUTABLE_TEMP)
+
+            with contextlib.closing(
+                    ITempFile(self.base_path, t_file_name)) as t_file:
+                for entry in data_file.iter_entries():
+                    if entry.key not in self._keydir or \
+                            entry.tstamp < self._keydir[entry.key].tstamp:
+                        continue
+
+                    t_file.write(entry.key, entry.value)
+
+            if t_file.size == 0:
+                t_file.delete()
+                continue
+
+            # build hint
+            self._immutables.pop(data_file.file_id)
+            data_file.delete()
+            self._immutables[t_file.file_id] = t_file.make_immutable()
+            t_file.update_keydir(self._keydir)
+            t_file.build_hint()
+
+        logger.info("optimize ended!")
+
     def contains(self, key):
         return key in self
 
     def keys(self):
         return self._keydir.keys()
-
-    #TODO 进程保护
-    def optimize(self):
-        """释放那些已经删除、无用的data entry
-        """
-        logger.info("optimize...")
-        for data_file in self._immutables.values():
-            if not data_file.should_optimize():
-                continue
-
-            key_entries = []
-            temp_immutable_file = DataFile(self.base_path, "%d.%s" % (
-                self.get_next_file_id(), IMMUTABLE_TEMP))
-            temp_immutable_file.init_write_fd()
-
-            for data_entry in data_file.iter_entries():
-                if data_entry.key not in self._keydir or \
-                    data_entry.tstamp < self._keydir[data_entry.key].tstamp:
-                    continue
-
-                tstamp, value_pos, value_sz = temp_immutable_file.write(
-                    data_entry.key, data_entry.value)
-                key_entries.append((data_entry.key, KeydirEntry(
-                    temp_immutable_file.file_id, tstamp, value_sz, value_pos)))
-
-            temp_immutable_file.close_write_fd()
-            if len(key_entries) == 0:
-                continue
-
-            new_file_name = temp_immutable_file.filename.replace(IMMUTABLE_TEMP, ACTIVE)
-            os.rename(temp_immutable_file.filename, new_file_name)
-            new_immutable_file = DataFile(*os.path.split(new_file_name))
-            new_immutable_file.init_read_fd()
-            data_file.close()
-            self._immutables.pop(data_file.file_id)
-            os.remove(data_file.filename)
-            self._immutables[new_immutable_file.file_id] = new_immutable_file
-
-            # update keydir
-            for key, entry in key_entries:
-                if key in self._keydir and self._keydir[key].tstamp <= entry.tstamp:
-                    self._keydir[key] = entry
-
-            # build hint file
-            temp_hint_file_name = os.path.join(self.base_path, "%d.%s" % (
-                new_immutable_file.file_id, HINT_TEMP))
-            with build_hint_file(temp_hint_file_name) as hint_file:
-                for key_entry in key_entries:
-                    hint_file.write(key_entry.key, key_entry.tstamp,
-                                    key_entry.value_pos, key_entry.value_sz)
-            new_hint_file_name = temp_hint_file_name.replace(HINT_TEMP, HINT)
-            os.rename(temp_hint_file_name, new_hint_file_name)
-
-        logger.info("optimize ended!")
 
     def __contains__(self, key):
         if not isinstance(key, bytes):
@@ -464,10 +474,9 @@ class BitCask(object):
 
     def close(self):
         for data_file in self._immutables.values():
-            data_file.close_read_fd()
+            data_file.close()
 
         if self._active_file:
-            self._active_file.close_read_fd()
-            self._active_file.close_write_fd()
+            self._active_file.close()
 
         self._keydir.clear()
