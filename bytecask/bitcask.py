@@ -140,8 +140,8 @@ class ITempFile(object):
         with open(t_hint_filename, 'wb') as hint_file:
             for key, entry in self.key_entries:
                 hint_file.write(hint_struct.pack(
-                    entry.tstamp, len(key), entry.value_sz,
-                    entry.value_pos) + key)
+                    entry.tstamp, len(key), entry.value_pos,
+                    entry.value_sz) + key)
         hint_filename = t_hint_filename.replace(HINT_TEMP, HINT)
         os.rename(t_hint_filename, hint_filename)
 
@@ -208,7 +208,7 @@ class DataFile(object):
                 try:
                     entry, new_pos = self._read(fmmap, pos)
                     pos = new_pos
-                    yield entry
+                    yield pos-len(entry.value), entry
                 except EOFError:
                     raise StopIteration
                 except BadCrcError:
@@ -237,6 +237,7 @@ class DataFile(object):
             raise BadHeaderError(e)
         key = fmmap[pos:pos+key_sz]
         pos += key_sz
+        value_pos = pos
         value = fmmap[pos:pos+value_sz]
         pos += value_sz
         # verify crc
@@ -301,7 +302,7 @@ class ActiveFile(DataFile):
 
 
 KeydirEntry = namedtuple("KeydirEntry", ['file_id', 'tstamp',
-                                         'value_sz', 'value_pos'])
+                                         'value_pos', 'value_sz'])
 
 
 class KeyDir(dict):
@@ -380,17 +381,17 @@ class BitCask(object):
                     self._keydir.pop(entry.key, None)
                 else:
                     self._keydir[entry.key] = KeydirEntry(
-                        data_file.file_id, entry.value_sz,
-                        entry.value_pos, entry.tstamp)
+                        data_file.file_id, entry.tstamp,
+                        entry.value_pos, entry.value_sz)
 
     def _load_from_data(self, data_file):
-        for entry in data_file.iter_entries():
+        for value_pos, entry in data_file.iter_entries():
             if entry.value == TOMBSTONE:
                 self._keydir.pop(entry.key, None)
             else:
                 self._keydir[entry.key] = KeydirEntry(
-                    data_file.file_id, entry.value_sz,
-                    entry.value_pos, entry.tstamp)
+                    data_file.file_id, entry.tstamp,
+                    value_pos, entry.value_sz)
 
     def get(self, key):
         if not isinstance(key, bytes):
@@ -434,7 +435,7 @@ class BitCask(object):
 
             with contextlib.closing(
                     ITempFile(self.base_path, t_file_name)) as t_file:
-                for entry in data_file.iter_entries():
+                for value_pos, entry in data_file.iter_entries():
                     if entry.key not in self._keydir or \
                             entry.tstamp < self._keydir[entry.key].tstamp:
                         continue
