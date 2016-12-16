@@ -98,8 +98,6 @@ class HintFile(object):
     def close(self):
         self.fd.close()
 
-DataEntry = namedtuple("DataEntry", ['crc32', 'tstamp', 'key_sz', 'value_sz', 'key', 'value'])
-
 # size
 crc32_fmt = ">I"
 crc32_size = struct.calcsize(crc32_fmt)
@@ -108,6 +106,8 @@ crc32_struct = struct.Struct(crc32_fmt)
 header_fmt = ">dii"
 header_size = struct.calcsize(header_fmt)
 header_struct = struct.Struct(header_fmt)
+
+DataEntry = namedtuple("DataEntry", ['crc32', 'tstamp', 'key_sz', 'value_sz', 'key', 'value'])
 
 
 class ITempFile(object):
@@ -237,7 +237,6 @@ class DataFile(object):
             raise BadHeaderError(e)
         key = fmmap[pos:pos+key_sz]
         pos += key_sz
-        value_pos = pos
         value = fmmap[pos:pos+value_sz]
         pos += value_sz
         # verify crc
@@ -264,7 +263,8 @@ class ImmutableFile(DataFile):
     def delete(self):
         self.close()
         os.unlink(self.filename)
-        os.unlink(self.hint_filename)
+        if self.has_hint:
+            os.unlink(self.hint_filename)
 
     def close(self):
         self.fd.close()

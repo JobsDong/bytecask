@@ -188,8 +188,57 @@ class BitCaskTest(TestCase):
         finally:
             bitcask2.close()
 
+    def test_new_active(self):
+        bitcask = BitCask("./testdir/bitcask3", max_file_size=30*3)
+        try:
+            bitcask.put("00001", "00001")
+            bitcask.put("00002", "00002")
+            bitcask.put("00003", "00003")
+            assert bitcask._active_file.size == 30*3
+            assert len(bitcask._immutables) == 0
+            bitcask.put("00004", "00004")
+            assert bitcask._active_file.size == 30
+            assert len(bitcask._immutables) == 1
+            assert bitcask.get("00001") == "00001"
+            assert bitcask.get("00004") == "00004"
+        finally:
+            bitcask.close()
+
     def test_optimize(self):
-        pass
+        bitcask = BitCask("./testdir/bitcask4", max_file_size=30*3)
+        try:
+            bitcask.put("00001", "00001")
+            bitcask.delete("00001")
+            bitcask.put("00002", "0")
+            assert not bitcask.contains("00001")
+            assert len(bitcask._immutables) == 0
+            bitcask.put("00003", "00003")
+            assert len(bitcask._immutables) == 1 and bitcask._immutables.values()[0].size == 30 * 3
+            assert bitcask._active_file.size == 30
+            # optimize
+            bitcask.optimize()
+            assert bitcask._immutables.values()[0].size == 26 and bitcask._active_file.size == 30
+            assert not bitcask.contains("00001") and bitcask.get("00003") == "00003"
+            assert bitcask._immutables.values()[0].has_hint
+        finally:
+            bitcask.close()
 
     def testk_build_keydir_from_hint(self):
-        pass
+        bitcask = BitCask("./testdir/bitcask5", max_file_size=30*3)
+        try:
+            bitcask.put("00001", "00001")
+            bitcask.delete("00001")
+            bitcask.put("00002", "0")
+            bitcask.put("00003", "00003")
+            # optimize
+            bitcask.optimize()
+        finally:
+            bitcask.close()
+
+        bitcask2 = BitCask("./testdir/bitcask5", max_file_size=30*3)
+        try:
+            assert bitcask2.get("00002") == "0"
+            assert bitcask2.get("00003") == "00003"
+            assert not bitcask2.contains("00001")
+        finally:
+            bitcask2.close()
