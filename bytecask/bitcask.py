@@ -42,7 +42,7 @@ def get_file_id(filename):
 HintEntry = namedtuple("HintEntry", ['tstamp', 'key_sz', 'value_sz',
                                      'value_pos', 'key'])
 
-hint_fmt = ">diii"
+hint_fmt = ">dIII"
 hint_size = struct.calcsize(hint_fmt)
 hint_struct = struct.Struct(hint_fmt)
 
@@ -103,7 +103,7 @@ crc32_fmt = ">I"
 crc32_size = struct.calcsize(crc32_fmt)
 crc32_struct = struct.Struct(crc32_fmt)
 
-header_fmt = ">dii"
+header_fmt = ">dII"
 header_size = struct.calcsize(header_fmt)
 header_struct = struct.Struct(header_fmt)
 
@@ -311,9 +311,12 @@ class KeyDir(dict):
 
 class BitCask(object):
     """bitcask
+        单个 data file最大不超过4G(value_pos是4个byte)
+        内存消耗，取决于个数和key(1G内存可以存储15,339,168个key为50byte的key-value对)
+        容量规划：1G内存700G硬盘能够存放50kB图片15339168张，需要大约0.5G的空出来，作为optimize和page cache
     """
 
-    def __init__(self, base_path, max_file_size=1024*1024*1024):
+    def __init__(self, base_path, max_file_size=3 << 30):
         self.base_path = base_path
         self.max_file_size = max_file_size
         if not os.path.exists(base_path):
